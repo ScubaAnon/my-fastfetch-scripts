@@ -1,42 +1,92 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-# Create an array containing all the container PIDs running right now
-mapfile -t containers <<< "$(pgrep -f shepherd.conf | awk -F ' ' 'NR>1 {print ""$1"";}')"
-Num_of_containers=${#containers[@]}
+# Create an array containing Guix container PIDs running
+mapfile -t containers < <(pgrep -f shepherd.conf | awk -F ' ' 'NR>1 {print $1;}')
+# Create an array containing names of running docker containers
+mapfile -t dockercontainers < <(docker ps --format '{{.Names}}' 2>/dev/null)
+# Create an array containing names of running QEMU/KVM VMs
+mapfile -t vms < <(virsh list --name | head -n -1) # head removes trailing newline
+
+FastfetchConfDir="/home/${SUDO_USER:-$(logname)}/.config/fastfetch/"
+# Needed to fetch names of Guix containers
+NsenterScriptDir=""
+Num_of_containers=$((${#containers[@]}+${#dockercontainers[@]}))
+Num_of_vms=${#vms[@]}
+# Point in your template.json where you want to insert container information.
+Array_index=11
+
+# Transform KB number into a meaningful string
+kb_to_human_readable() {
+    echo "$1" | numfmt --from-unit=1024 --to=iec --suffix=B --format="%.2f" | sed 's/\([0-9.]\)\([A-Z]\)/\1 \2/'
+}
 
 # First object to be inserted
-jq --arg num "$Num_of_containers" '.modules |= .[:11] + [{ "type": "custom", "format": "\u001b[1;38;5;63m🖧 C#\u001b[0m: " + $num }] + .[11:]' /home/guix/.config/fastfetch/template.json > /home/guix/.config/fastfetch/tmp.json
+jq --arg num "$Num_of_containers" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m🖧 C#\u001b[0m: " + $num }] + .[$index:]' "${FastfetchConfDir}template.json" > "${FastfetchConfDir}tmp.json"
 
-# Fetch information for each container, then create and insert objects to config
+# Fetch information for each Guix container, then create and insert objects to config
+# TODO: Should maybe have a check on whether $containers is empty too, but eh.
 KB_Total=0
-Array_index=11
-for i in "${containers[@]}"; do
+for pid in "${containers[@]}"; do
     ((++Array_index))
-    PID=$i
-    hostname=$(sudo /home/guix/bin/nsenter.sh "$i")
-    KB=$(ps -o rss -p "$i" --ppid "$i" | awk -F ' ' 'NR>1 {print ""$1"";}' | awk '{printf "%s+",$0} END {print "0"}' | bc)
+    hostname=$(sudo "${NsenterScriptDir}/nsenter.sh" "$pid" 0)
+    KB=$(ps -o rss -p "$pid" --ppid "$pid" | awk -F ' ' 'NR>1 {print ""$1"";}' | awk '{printf "%s+",$0} END {print "0"}' | bc)
     (( KB_Total += KB ))
 
-    # Transform $KB into a meaningful string
-    if [[ "$KB" -ge 10240 ]]; then
-        KB="$(echo "scale=2; $KB / 1024" | bc) MB"
-    else
-        KB="$KB KB"
-    fi
+    KB_Human=$(kb_to_human_readable "$KB")
 
-    jq --arg PID "$PID" --arg hostname "$hostname" --arg KB "$KB" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ├ \u001b[0m " + $hostname + ": " + $KB + " memory usage - PID " + $PID }] + .[$index:]' /home/guix/.config/fastfetch/tmp.json | sponge /home/guix/.config/fastfetch/tmp.json
+    jq --arg PID "$pid" --arg hostname "$hostname" --arg KB "$KB_Human" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ├ \u001b[0m " + $hostname + ": " + $KB + " memory usage - PID " + $PID }] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
 done
 
-# Transform $KB_Total into a meaningful string
-if [[ "$KB_Total" -ge 10240 ]]; then
-    KB_Total="$(echo "scale=2; $KB_Total / 1024" | bc) MB"
-else
-    KB_Total="$KB_Total KB"
+if [[ -n ${#dockercontainers[@]} ]]; then
+    for d in "${dockercontainers[@]}"; do
+	    ((++Array_index))
+	    name="${d#docker-}"
+        name="${name^}"
+        mem=$(docker stats --no-stream --format "{{.MemUsage}}" "$d" | awk '{print $1}')
+        (( KB_Total += $(echo "${mem%B}" | numfmt --from=auto --to-unit=1024) ))
+        mem=$(echo "$mem" | sed 's/\([0-9.]\)\([A-Z]\)/\1 \2/')
+        
+        jq --arg name "$name" --arg mem "$mem" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ├ \u001b[0m " + $name + ": " + $mem + " memory usage" }] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
+    done
 fi
 
-((++Array_index))
-jq --arg total "$KB_Total" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ╰┈➤\u001b[0m Total: " + $total + " of memory" }] + .[$index:]' /home/guix/.config/fastfetch/tmp.json > /home/guix/.config/fastfetch/config.jsonc
+KB_Total=$(kb_to_human_readable "$KB_Total")
 
-rm /home/guix/.config/fastfetch/tmp.json
+# Finish container section, proceed (else) with VMs sections if VMs are detected
+if [[ -z ${#vms[@]} ]]; then
+    ((++Array_index))
+    jq --arg total "$KB_Total" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ╰┈➤\u001b[0m Total: " + $total + " of memory" }] + .[$index:]' "${FastfetchConfDir}tmp.json" > "${FastfetchConfDir}config.jsonc"
+else
+    ((++Array_index))
+    jq --arg total "$KB_Total" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ╰┈➤\u001b[0m Total: " + $total + " of memory" }] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
+
+    # Simple linebreak
+    ((++Array_index))
+    jq --argjson index "$Array_index" '.modules |= .[:$index] + ["break"] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
+
+    # Add VMs section
+    ((++Array_index))
+    jq --arg num "$Num_of_vms" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m🖧 VM#\u001b[0m: " + $num }] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
+
+    KB_Total=0
+    for vm in "${vms[@]}"; do
+        ((++Array_index))
+        KB=$(virsh dommemstat "$vm" | awk '/^actual/{print $2}')
+        (( KB_Total += KB ))
+        
+        # Transform $KB into a meaningful string
+        KB_Human=$(kb_to_human_readable "$KB")
+        
+        jq --arg vm "$vm" --arg KB "$KB_Human" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ├ \u001b[0m " + $vm + ": " + $KB + " memory usage" }] + .[$index:]' "${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
+    done
+
+    KB_Total=$(kb_to_human_readable "$KB_Total")
+
+    ((++Array_index))
+    jq --arg total "$KB_Total" --argjson index "$Array_index" '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ╰┈➤\u001b[0m Total: " + $total + " of memory" }] + .[$index:]' "${FastfetchConfDir}tmp.json" > "${FastfetchConfDir}config.jsonc"
+fi
+
+rm "${FastfetchConfDir=}tmp.json"
 
 exit 0
