@@ -9,8 +9,12 @@ mapfile -t dockercontainers < <(docker ps --format '{{.Names}}' 2>/dev/null)
 mapfile -t vms < <(virsh list --name | head -n -1) # head removes trailing newline
 
 FastfetchConfDir="/home/${SUDO_USER:-$(logname)}/.config/fastfetch/"
+# Sanity check
+if [[ ! -f "${FastfetchConfDir}template.json" ]]; then
+  echo "Error: template.json not found." >&2
+  exit 1
+fi
 # Needed to fetch names of Guix containers
-NsenterScriptDir=""
 Num_of_containers=$((${#containers[@]}+${#dockercontainers[@]}))
 Num_of_vms=${#vms[@]}
 # Point in your template.json where you want to insert container information.
@@ -29,7 +33,7 @@ jq --arg num "$Num_of_containers" --argjson index "$Array_index" '.modules |= .[
 KB_Total=0
 for pid in "${containers[@]}"; do
     ((++Array_index))
-    hostname=$(sudo "${NsenterScriptDir}/nsenter.sh" "$pid" 0)
+    hostname=$(sudo /run/current-system/profile/bin/nsenter "$pid" hostname)
     KB=$(ps -o rss -p "$pid" --ppid "$pid" | awk -F ' ' 'NR>1 {print ""$1"";}' | awk '{printf "%s+",$0} END {print "0"}' | bc)
     (( KB_Total += KB ))
 
