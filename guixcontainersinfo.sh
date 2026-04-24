@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Transform KB number into a meaningful string
+kb_to_human_readable() {
+    if (( $1 >= 1024 * 1024 )); then
+        printf "%.2f GiB" $(echo "scale=2; $1 / 1024 / 1024" | bc)
+    elif (( $1 >= 1024 )); then
+        printf "%.2f MiB" $(echo "scale=2; $1 / 1024" | bc)
+    else
+        echo "${1} KiB"
+    fi
+}
+
 # Create an array containing Guix container PIDs running
 mapfile -t containers < <(pgrep -f shepherd.conf | awk -F ' ' 'NR>1 {print $1;}')
 # Create an array containing names of running docker containers
@@ -20,11 +31,6 @@ Num_of_vms=${#vms[@]}
 # Point in your template.json where you want to insert container information.
 Array_index=11
 
-# Transform KB number into a meaningful string
-kb_to_human_readable() {
-    echo "$1" | numfmt --from-unit=1024 --to=iec --suffix=B --format="%.2f" | sed 's/\([0-9.]\)\([A-Z]\)/\1 \2/'
-}
-
 # First object to be inserted
 jq --arg num "$Num_of_containers" --argjson index "$Array_index" \
 '.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m🖧 C#\u001b[0m: " + $num }] + .[$index:]' \
@@ -36,7 +42,7 @@ KB_Total=0
 for pid in "${containers[@]}"; do
     ((++Array_index))
     hostname=$(sudo /run/current-system/profile/bin/nsenter "$pid" hostname)
-    KB=$(ps -o rss -p "$pid" --ppid "$pid" | awk -F ' ' 'NR>1 {print ""$1"";}' | awk '{printf "%s+",$0} END {print "0"}' | bc)
+    KB=$(ps -o rss -p "$pid" --ppid "$pid" | awk -F ' ' 'NR>1 {print $1;}' | awk '{printf "%s+",$0} END {print "0"}' | bc)
     (( KB_Total += KB ))
 
     KB_Human=$(kb_to_human_readable "$KB")
@@ -51,10 +57,12 @@ if [[ -n ${#dockercontainers[@]} ]]; then
 	    ((++Array_index))
 	    name="${d#docker-}"
         name="${name^}"
-        mem=$(docker stats --no-stream --format "{{.MemUsage}}" "$d" | awk '{print $1}')
-        (( KB_Total += $(echo "${mem%B}" | numfmt --from=auto --to-unit=1024) ))
-        mem=$(echo "$mem" | sed 's/\([0-9.]\)\([A-Z]\)/\1 \2/')
-        
+		container_id=$(docker inspect --format '{{.Id}}' "$d")
+		mem_bytes=$(cat "/sys/fs/cgroup/docker/${container_id}/memory.current")
+		KB=$((mem_bytes / 1024))
+		(( KB_Total += KB ))
+		mem=$(units_handler "$KB")
+		
         jq --arg name "$name" --arg mem "$mem" --argjson index "$Array_index" \
 		'.modules |= .[:$index] + [{ "type": "custom", "format": "\u001b[1;38;5;63m  ├ \u001b[0m " + $name + ": " + $mem + " memory usage" }] + .[$index:]' \
 		"${FastfetchConfDir}tmp.json" | sponge "${FastfetchConfDir}tmp.json"
